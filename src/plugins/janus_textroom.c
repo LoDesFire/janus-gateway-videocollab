@@ -514,11 +514,11 @@ post = <optional backend to contact via HTTP post for all incoming messages>
 
 
 /* Plugin information */
-#define JANUS_TEXTROOM_VERSION			2
-#define JANUS_TEXTROOM_VERSION_STRING	"0.0.2"
+#define JANUS_TEXTROOM_VERSION			10
+#define JANUS_TEXTROOM_VERSION_STRING	"0.1.0"
 #define JANUS_TEXTROOM_DESCRIPTION		"This is a plugin implementing a text-only room for Janus, using DataChannels."
-#define JANUS_TEXTROOM_NAME				"JANUS TextRoom plugin"
-#define JANUS_TEXTROOM_AUTHOR			"Meetecho s.r.l."
+#define JANUS_TEXTROOM_NAME				"JANUS TextRoom plugin. VideoCollab edition"
+#define JANUS_TEXTROOM_AUTHOR			"Meetecho s.r.l. + Daniil Shumski"
 #define JANUS_TEXTROOM_PACKAGE			"janus.plugin.textroom"
 
 /* Plugin methods */
@@ -611,6 +611,7 @@ static struct janus_json_parameter create_parameters[] = {
 	{"is_private", JANUS_JSON_BOOL, 0},
 	{"history", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"allowed", JSON_ARRAY, 0},
+    {"owner_id", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
 	{"permanent", JANUS_JSON_BOOL, 0}
 };
 static struct janus_json_parameter destroy_parameters[] = {
@@ -676,6 +677,8 @@ typedef struct janus_textroom_room {
 	gchar *room_name;			/* Room description */
 	gchar *room_secret;			/* Secret needed to manipulate (e.g., destroy) this room */
 	gchar *room_pin;			/* Password needed to join this room, if any */
+    gchar *owner_id;			/* Owner of the Textroom User Id */
+    gchar *video_operator_id;	/* Operator of VideoCollab room */
 	gboolean is_private;		/* Whether this room is 'private' (as in hidden) or not */
 	gchar *http_backend;		/* Server to contact via HTTP POST for incoming messages, if any */
 	GHashTable *participants;	/* Map of participants */
@@ -727,6 +730,8 @@ static void janus_textroom_room_free(const janus_refcount *textroom_ref) {
 	g_free(textroom->room_name);
 	g_free(textroom->room_secret);
 	g_free(textroom->room_pin);
+    g_free(textroom->video_operator_id);
+    g_free(textroom->owner_id);
 	g_free(textroom->http_backend);
 	g_hash_table_destroy(textroom->participants);
 	g_hash_table_destroy(textroom->allowed);
@@ -922,7 +927,7 @@ int janus_textroom_init(janus_callbacks *callback, const char *config_path) {
 	if(config != NULL) {
 		GList *clist = janus_config_get_categories(config, NULL), *cl = clist;
 		while(cl != NULL) {
-			janus_config_category *cat = (janus_config_category *)cl->data;
+            janus_config_category *cat = (janus_config_category *)cl->data;
 			if(cat->name == NULL || !strcasecmp(cat->name, "general")) {
 				cl = cl->next;
 				continue;
@@ -933,8 +938,14 @@ int janus_textroom_init(janus_callbacks *callback, const char *config_path) {
 			janus_config_item *secret = janus_config_get(config, cat, janus_config_type_item, "secret");
 			janus_config_item *pin = janus_config_get(config, cat, janus_config_type_item, "pin");
 			janus_config_item *history = janus_config_get(config, cat, janus_config_type_item, "history");
+            janus_config_item *owner_id = janus_config_get(config, cat, janus_config_type_item, "owner_id");
 			janus_config_item *post = janus_config_get(config, cat, janus_config_type_item, "post");
 			/* Create the text room */
+            if(owner_id == NULL || owner_id->value == NULL) {
+                JANUS_LOG(LOG_ERR, "Owner Id is missing");
+                cl = cl->next;
+                continue;
+            }
 			janus_textroom_room *textroom = g_malloc0(sizeof(janus_textroom_room));
 			const char *room_num = cat->name;
 			if(strstr(room_num, "room-") == room_num)
@@ -974,6 +985,8 @@ int janus_textroom_init(janus_callbacks *callback, const char *config_path) {
 				description = g_strdup(desc->value);
 			else
 				description = g_strdup(cat->name);
+            textroom->owner_id = g_strdup(owner_id->value);
+            textroom->video_operator_id = g_strdup(owner_id->value);
 			textroom->room_name = description;
 			textroom->is_private = priv && priv->value && janus_is_true(priv->value);
 			if(secret != NULL && secret->value != NULL) {
@@ -1766,6 +1779,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 		/* Check if we need to send some history back */
 		json_t *history = json_object_get(root, "history");
 		gboolean send_history = history ? json_is_true(history) : TRUE;
+        gboolean is_owner = !strcasecmp(username_text, textroom->owner_id);
 		if(send_history) {
 			if(textroom->history != NULL && textroom->history->head != NULL) {
 				GList *temp = textroom->history->head;
@@ -1832,6 +1846,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 			/* Send response back */
 			reply = json_object();
 			json_object_set_new(reply, "textroom", json_string("success"));
+            json_object_set_new(reply, "is_owner", is_owner ? json_true() : json_false());
 			json_object_set_new(reply, "participants", list);
 		}
 		/* Also notify event handlers */
@@ -2452,6 +2467,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 				goto msg_response;
 		}
 		json_t *room = json_object_get(root, "room");
+        json_t *owner_id = json_object_get(root, "owner_id");
 		json_t *desc = json_object_get(root, "description");
 		json_t *is_private = json_object_get(root, "is_private");
 		json_t *allowed = json_object_get(root, "allowed");
@@ -2536,6 +2552,8 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 			room_id_allocated = TRUE;
 		}
 		textroom->room_id = room_id;
+        textroom->owner_id = g_strdup(json_string_value(owner_id));
+        textroom->video_operator_id = g_strdup(json_string_value(owner_id));
 		textroom->room_id_str = room_id_str ? g_strdup(room_id_str) : NULL;
 		char *description = NULL;
 		if(desc != NULL && strlen(json_string_value(desc)) > 0) {
@@ -2600,6 +2618,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 			janus_config_category *c = janus_config_get_create(config, NULL, janus_config_type_category, cat);
 			/* Now for the values */
 			janus_config_add(config, c, janus_config_item_create("description", textroom->room_name));
+            janus_config_add(config, c, janus_config_item_create("owner_id", textroom->owner_id));
 			if(textroom->is_private)
 				janus_config_add(config, c, janus_config_item_create("is_private", "yes"));
 			if(textroom->room_secret)
@@ -2775,6 +2794,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 			/* Now write the room details again */
 			janus_config_category *c = janus_config_get_create(config, NULL, janus_config_type_category, cat);
 			janus_config_add(config, c, janus_config_item_create("description", textroom->room_name));
+            janus_config_add(config, c, janus_config_item_create("owner_id", textroom->owner_id));
 			if(textroom->is_private)
 				janus_config_add(config, c, janus_config_item_create("is_private", "yes"));
 			if(textroom->room_secret)
