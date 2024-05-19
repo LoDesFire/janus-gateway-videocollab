@@ -648,6 +648,9 @@ static struct janus_json_parameter message_parameters[] = {
 	{"tos", JSON_ARRAY, 0},
 	{"ack", JANUS_JSON_BOOL, 0}
 };
+static struct janus_json_parameter set_operator_parameters[] = {
+        {"username", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
 static struct janus_json_parameter announcement_parameters[] = {
 	{"secret", JSON_STRING, 0},
 	{"text", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
@@ -1839,16 +1842,19 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 			}
 			free(event_text);
 		}
-		janus_mutex_unlock(&session->mutex);
-		janus_mutex_unlock(&textroom->mutex);
-		janus_refcount_decrease(&textroom->ref);
 		if(!internal) {
 			/* Send response back */
 			reply = json_object();
 			json_object_set_new(reply, "textroom", json_string("success"));
-            json_object_set_new(reply, "is_owner", is_owner ? json_true() : json_false());
+            if (is_owner) {
+                json_object_set_new(reply, "is_owner", json_true());
+                json_object_set_new(reply, "operator_id", json_string(textroom->video_operator_id));
+            }
 			json_object_set_new(reply, "participants", list);
 		}
+        janus_mutex_unlock(&session->mutex);
+        janus_mutex_unlock(&textroom->mutex);
+        janus_refcount_decrease(&textroom->ref);
 		/* Also notify event handlers */
 		if(notify_events && gateway->events_is_enabled()) {
 			json_t *info = json_object();
@@ -2956,7 +2962,131 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 			json_object_set_new(info, "room", string_ids ? json_string(room_id_str) : json_integer(room_id));
 			gateway->notify_event(&janus_textroom_plugin, session ? session->handle : NULL, info);
 		}
-	} else {
+	} else if(!strcasecmp(request_text, "set_operator")) {
+        JANUS_VALIDATE_JSON_OBJECT(root, set_operator_parameters,
+                                   error_code, error_cause, TRUE,
+                                   JANUS_TEXTROOM_ERROR_MISSING_ELEMENT, JANUS_TEXTROOM_ERROR_INVALID_ELEMENT);
+        if(error_code != 0)
+            goto msg_response;
+        if(!string_ids) {
+            JANUS_VALIDATE_JSON_OBJECT(root, room_parameters,
+                                       error_code, error_cause, TRUE,
+                                       JANUS_TEXTROOM_ERROR_MISSING_ELEMENT, JANUS_TEXTROOM_ERROR_INVALID_ELEMENT);
+        } else {
+            JANUS_VALIDATE_JSON_OBJECT(root, roomstr_parameters,
+                                       error_code, error_cause, TRUE,
+                                       JANUS_TEXTROOM_ERROR_MISSING_ELEMENT, JANUS_TEXTROOM_ERROR_INVALID_ELEMENT);
+        }
+        if(error_code != 0)
+            goto msg_response;
+        json_t *room = json_object_get(root, "room");
+        json_t *username = json_object_get(root, "username");
+        guint64 room_id = 0;
+        char room_id_num[30], *room_id_str = NULL;
+        if(!string_ids) {
+            room_id = json_integer_value(room);
+            g_snprintf(room_id_num, sizeof(room_id_num), "%"SCNu64, room_id);
+            room_id_str = room_id_num;
+        } else {
+            room_id_str = (char *)json_string_value(room);
+        }
+        janus_mutex_lock(&rooms_mutex);
+        janus_textroom_room *textroom = g_hash_table_lookup(rooms,
+                                                            string_ids ? (gpointer)room_id_str : (gpointer)&room_id);
+        if(textroom == NULL) {
+            janus_mutex_unlock(&rooms_mutex);
+            JANUS_LOG(LOG_ERR, "No such room (%s)\n", room_id_str);
+            error_code = JANUS_TEXTROOM_ERROR_NO_SUCH_ROOM;
+            g_snprintf(error_cause, 512, "No such room (%s)", room_id_str);
+            goto msg_response;
+        }
+        janus_refcount_increase(&textroom->ref);
+        janus_mutex_unlock(&rooms_mutex);
+        janus_mutex_lock(&textroom->mutex);
+        janus_textroom_participant *participant = g_hash_table_lookup(session->rooms,
+                                                                      string_ids ? (gpointer)room_id_str : (gpointer)&room_id);
+        if(participant == NULL) {
+            janus_mutex_unlock(&textroom->mutex);
+            janus_refcount_decrease(&textroom->ref);
+            JANUS_LOG(LOG_ERR, "Not in room %s\n", room_id_str);
+            error_code = JANUS_TEXTROOM_ERROR_NOT_IN_ROOM;
+            g_snprintf(error_cause, 512, "Not in room %s", room_id_str);
+            goto msg_response;
+        }
+        janus_refcount_increase(&participant->ref);
+        if (strcasecmp(participant->username, textroom->owner_id)) {
+            janus_mutex_unlock(&textroom->mutex);
+            janus_refcount_decrease(&textroom->ref);
+            JANUS_LOG(LOG_ERR, "Not owner in room %s\n", room_id_str);
+            error_code = JANUS_TEXTROOM_ERROR_UNAUTHORIZED;
+            g_snprintf(error_cause, 512, "Not owner in room %s", room_id_str);
+            goto msg_response;
+        }
+        const char *user_id = json_string_value(username);
+        janus_textroom_participant *new_operator_participant = g_hash_table_lookup(textroom->participants, user_id);
+        if(new_operator_participant == NULL) {
+            janus_mutex_unlock(&textroom->mutex);
+            janus_refcount_decrease(&textroom->ref);
+            JANUS_LOG(LOG_ERR, "No such participant %s in room %s\n", user_id, room_id_str);
+            error_code = JANUS_TEXTROOM_ERROR_NO_SUCH_USER;
+            g_snprintf(error_cause, 512, "No such user %s in room %s", user_id, room_id_str);
+            goto msg_response;
+        }
+        char *old_video_operator_id = textroom->video_operator_id;
+        char *new_video_operator_id = g_strdup(json_string_value(username));
+        textroom->video_operator_id = new_video_operator_id;
+
+        /* Prepare outgoing message */
+        json_t *msg = json_object();
+        json_object_set_new(msg, "textroom", json_string("new_operator"));
+        json_object_set_new(msg, "room", string_ids ? json_string(room_id_str) : json_integer(room_id));
+        json_object_set_new(msg, "username", json_string(new_video_operator_id));
+
+        char *msg_text = json_dumps(msg, json_format);
+        if(msg_text == NULL) {
+            json_decref(msg);
+            janus_mutex_unlock(&textroom->mutex);
+            janus_refcount_decrease(&textroom->ref);
+            JANUS_LOG(LOG_ERR, "Failed to stringify message...\n");
+            error_code = JANUS_TEXTROOM_ERROR_UNKNOWN_ERROR;
+            g_snprintf(error_cause, 512, "Failed to stringify message");
+            goto msg_response;
+        }
+        json_decref(msg);
+
+        json_t *usernames = json_array();
+        json_array_append_new(usernames, json_string(new_video_operator_id));
+        json_array_append_new(usernames, json_string(old_video_operator_id));
+
+        /*Sending to the old and new video_operators*/
+        gboolean success = 1;
+        size_t i = 0;
+        for(i=0; i < json_array_size(usernames); i++) {
+            json_t *u = json_array_get(usernames, i);
+            const char *to = json_string_value(u);
+            JANUS_LOG(LOG_VERB, "To %s in %s: new_operator\n", to, room_id_str);
+            janus_textroom_participant *top = g_hash_table_lookup(textroom->participants, to);
+            if(top) {
+                janus_refcount_increase(&top->ref);
+                janus_plugin_data data = { .label = NULL, .protocol = NULL, .binary = FALSE, .buffer = msg_text, .length = strlen(msg_text) };
+                gateway->relay_data(top->session->handle, &data);
+                janus_refcount_decrease(&top->ref);
+            } else {
+                JANUS_LOG(LOG_WARN, "User %s is not in room %s, failed to send event\n", to, room_id_str);
+                success = 0;
+            }
+        }
+        reply = json_object();
+        json_object_set_new(reply, "textroom", json_string(success ? "success" : "error"));
+
+        json_decref(usernames);
+        g_free(old_video_operator_id);
+
+        janus_refcount_decrease(&participant->ref);
+        free(msg_text);
+        janus_mutex_unlock(&textroom->mutex);
+        janus_refcount_decrease(&textroom->ref);
+    } else {
 		JANUS_LOG(LOG_ERR, "Unsupported request %s\n", request_text);
 		error_code = JANUS_TEXTROOM_ERROR_INVALID_REQUEST;
 		g_snprintf(error_cause, 512, "Unsupported request %s", request_text);
