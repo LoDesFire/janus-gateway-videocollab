@@ -831,6 +831,7 @@ static void janus_textroom_message_free(janus_textroom_message *msg) {
 #define JANUS_TEXTROOM_ERROR_ALREADY_IN_ROOM	421
 #define JANUS_TEXTROOM_ERROR_NOT_IN_ROOM		422
 #define JANUS_TEXTROOM_ERROR_NO_SUCH_USER		423
+#define JANUS_TEXTROOM_ERROR_FORBIDDEN		    424
 #define JANUS_TEXTROOM_ERROR_UNKNOWN_ERROR		499
 
 #ifdef HAVE_LIBCURL
@@ -1529,6 +1530,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 		json_t *username = json_object_get(root, "to");
 		json_t *usernames = json_object_get(root, "tos");
 		if(username && usernames) {
+            janus_refcount_decrease(&participant->ref);
 			janus_mutex_unlock(&textroom->mutex);
 			janus_refcount_decrease(&textroom->ref);
 			JANUS_LOG(LOG_ERR, "Both to and tos array provided\n");
@@ -1555,6 +1557,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 		char *msg_text = json_dumps(msg, json_format);
 		if(msg_text == NULL) {
 			json_decref(msg);
+            janus_refcount_decrease(&participant->ref);
 			janus_mutex_unlock(&textroom->mutex);
 			janus_refcount_decrease(&textroom->ref);
 			JANUS_LOG(LOG_ERR, "Failed to stringify message...\n");
@@ -1778,6 +1781,41 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 			string_ids ? (gpointer)g_strdup(textroom->room_id_str) : (gpointer)janus_uint64_dup(textroom->room_id),
 			participant);
 		janus_refcount_increase(&participant->ref);
+
+        /* If room is empty changes video_operator */
+        if (textroom->participants) {
+            char *old_operator = textroom->video_operator_id;
+            char *new_operator = g_strdup(participant->username);
+            textroom->video_operator_id = new_operator;
+            g_free(old_operator);
+
+            /* Notifying new operator */
+            json_t *notification = json_object();
+            json_object_set_new(notification, "textroom", json_string("new_operator"));
+            json_object_set_new(notification, "room", string_ids ? json_string(textroom->room_id_str) : json_integer(textroom->room_id));
+            json_object_set_new(notification, "username", json_string(new_operator));
+            char *notification_text = json_dumps(notification, json_format);
+            json_decref(notification);
+            if(notification_text == NULL) {
+                janus_mutex_unlock(&session->mutex);
+                janus_mutex_unlock(&textroom->mutex);
+                janus_refcount_decrease(&textroom->ref);
+                janus_refcount_decrease(&participant->ref);
+                janus_textroom_participant_destroy(participant);
+                JANUS_LOG(LOG_ERR, "Failed to stringify message...\n");
+                error_code = JANUS_TEXTROOM_ERROR_UNKNOWN_ERROR;
+                g_snprintf(error_cause, 512, "Failed to stringify message");
+                goto msg_response;
+            }
+            janus_plugin_data data = { .label = NULL, .protocol = NULL, .binary = FALSE, .buffer = notification_text, .length = strlen(notification_text) };
+
+            janus_textroom_participant *top =  g_hash_table_lookup(textroom->participants, new_operator);
+            janus_refcount_increase(&top->ref);
+            JANUS_LOG(LOG_VERB, "  >> To %s in %s: new_operator\n", top->username, room_id_str);
+            gateway->relay_data(top->session->handle, &data);
+            janus_refcount_decrease(&top->ref);
+        }
+
 		g_hash_table_insert(textroom->participants, participant->username, participant);
 		/* Check if we need to send some history back */
 		json_t *history = json_object_get(root, "history");
@@ -1917,6 +1955,51 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
 		g_hash_table_remove(textroom->participants, participant->username);
 		participant->session = NULL;
 		participant->room = NULL;
+
+        gboolean is_operator = !strcasecmp(participant->username, textroom->video_operator_id);
+        /* Choosing the person who will be the next video_operetor*/
+        if (is_operator) {
+            gchar *new_operator_id = NULL;
+            janus_textroom_participant *owner = g_hash_table_lookup(textroom->participants,textroom->owner_id);
+            if (owner == NULL && textroom->participants) {
+                GHashTableIter participants_iter;
+                gpointer username_pointer;
+                g_hash_table_iter_init(&participants_iter, textroom->participants);
+                g_hash_table_iter_next(&participants_iter, &username_pointer, NULL);
+                gchar *username = username_pointer;
+                new_operator_id = g_strdup(username);
+            }
+            else new_operator_id = g_strdup(textroom->owner_id);
+            /* Notifying new operator */
+            json_t *notification = json_object();
+            json_object_set_new(notification, "textroom", json_string("new_operator"));
+            json_object_set_new(notification, "room", string_ids ? json_string(textroom->room_id_str) : json_integer(textroom->room_id));
+            json_object_set_new(notification, "username", json_string(new_operator_id));
+            char *notification_text = json_dumps(notification, json_format);
+            json_decref(notification);
+            if(notification_text == NULL) {
+                janus_mutex_unlock(&session->mutex);
+                janus_mutex_unlock(&textroom->mutex);
+                janus_refcount_decrease(&textroom->ref);
+                janus_refcount_decrease(&participant->ref);
+                janus_textroom_participant_destroy(participant);
+                JANUS_LOG(LOG_ERR, "Failed to stringify message...\n");
+                error_code = JANUS_TEXTROOM_ERROR_UNKNOWN_ERROR;
+                g_snprintf(error_cause, 512, "Failed to stringify message");
+                goto msg_response;
+            }
+            janus_plugin_data data = { .label = NULL, .protocol = NULL, .binary = FALSE, .buffer = notification_text, .length = strlen(notification_text) };
+
+            char *old_operator = textroom->video_operator_id;
+            textroom->video_operator_id = new_operator_id;
+            g_free(old_operator);
+
+            janus_textroom_participant *top =  g_hash_table_lookup(textroom->participants, new_operator_id);
+            janus_refcount_increase(&top->ref);
+            JANUS_LOG(LOG_VERB, "  >> To %s in %s: new_operator\n", top->username, room_id_str);
+            gateway->relay_data(top->session->handle, &data);
+            janus_refcount_decrease(&top->ref);
+        }
 		/* Notify all participants */
 		JANUS_LOG(LOG_VERB, "Notifying all participants about the new leave\n");
 		if(textroom->participants) {
@@ -3018,7 +3101,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
             janus_mutex_unlock(&textroom->mutex);
             janus_refcount_decrease(&textroom->ref);
             JANUS_LOG(LOG_ERR, "Not owner in room %s\n", room_id_str);
-            error_code = JANUS_TEXTROOM_ERROR_UNAUTHORIZED;
+            error_code = JANUS_TEXTROOM_ERROR_FORBIDDEN;
             g_snprintf(error_cause, 512, "Not owner in room %s", room_id_str);
             goto msg_response;
         }
@@ -3030,6 +3113,14 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
             JANUS_LOG(LOG_ERR, "No such participant %s in room %s\n", user_id, room_id_str);
             error_code = JANUS_TEXTROOM_ERROR_NO_SUCH_USER;
             g_snprintf(error_cause, 512, "No such user %s in room %s", user_id, room_id_str);
+            goto msg_response;
+        }
+        if (!strcasecmp(participant->username, new_operator_participant->username)) {
+            janus_mutex_unlock(&textroom->mutex);
+            janus_refcount_decrease(&textroom->ref);
+            JANUS_LOG(LOG_ERR, "Already operator\n");
+            error_code = JANUS_TEXTROOM_ERROR_INVALID_REQUEST;
+            g_snprintf(error_cause, 512, "Already operator");
             goto msg_response;
         }
         char *old_video_operator_id = textroom->video_operator_id;
