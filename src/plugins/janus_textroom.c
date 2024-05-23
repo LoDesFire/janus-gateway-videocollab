@@ -3329,7 +3329,8 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
                 janus_refcount_decrease(&top->ref);
             }
         }
-
+        
+        internal = 1;
         janus_refcount_decrease(&participant->ref);
         free(msg_text);
         janus_mutex_unlock(&textroom->mutex);
