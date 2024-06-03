@@ -3287,15 +3287,15 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
         }
 
         json_t *is_playing = json_object_get(root, "is_playing");
-        json_t *time = json_object_get(root, "time");
+        json_t *movie_time = json_object_get(root, "time");
         json_t *current_movie = json_object_get(root, "current_movie");
 
         json_t *syncronization_json = json_object();
         json_object_set(syncronization_json, "textroom", json_string("sync"));
         if (is_playing)
             json_object_set(syncronization_json, "is_playing", is_playing);
-        if (time)
-            json_object_set(syncronization_json, "time", time);
+        if (movie_time)
+            json_object_set(syncronization_json, "time", movie_time);
         if (playlist) {
             json_t *new_playlist = json_deep_copy(playlist);
             json_t *old_playlist = textroom->playlist;
