@@ -654,13 +654,13 @@ static struct janus_json_parameter set_operator_parameters[] = {
 static struct janus_json_parameter sync_parameters[] = {
         {"is_playing", JANUS_JSON_BOOL, JANUS_JSON_PARAM_REQUIRED},
         {"time", JSON_REAL, JANUS_JSON_PARAM_REQUIRED},
-        {"current_movie", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+        {"current_movie", JSON_STRING, JANUS_JSON_PARAM_POSITIVE},
         {"playlist", JSON_ARRAY, 0}
 };
 static struct janus_json_parameter sync_playlist_parameters[] = {
         {"is_playing", JANUS_JSON_BOOL, 0},
         {"time", JSON_REAL, 0},
-        {"current_movie", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE | JANUS_JSON_PARAM_REQUIRED},
+        {"current_movie", JSON_STRING, JANUS_JSON_PARAM_POSITIVE | JANUS_JSON_PARAM_REQUIRED},
         {"playlist", JSON_ARRAY, JANUS_JSON_PARAM_REQUIRED}
 };
 static struct janus_json_parameter announcement_parameters[] = {
@@ -694,7 +694,7 @@ typedef struct janus_textroom_room {
 	gchar *room_pin;			/* Password needed to join this room, if any */
     gchar *owner_id;			/* Owner of the Textroom User Id */
     json_t *playlist;           /* Serialized json Playlist of the room */
-    gint64 current_movie;       /* Current movie in the room */
+    gchar *current_movie;       /* Current movie in the room */
     gchar *video_operator_id;	/* Operator of VideoCollab room */
 	gboolean is_private;		/* Whether this room is 'private' (as in hidden) or not */
 	gchar *http_backend;		/* Server to contact via HTTP POST for incoming messages, if any */
@@ -750,6 +750,8 @@ static void janus_textroom_room_free(const janus_refcount *textroom_ref) {
     g_free(textroom->video_operator_id);
     g_free(textroom->owner_id);
 	g_free(textroom->http_backend);
+    g_free(textroom->current_movie);
+    json_decref(textroom->playlist);
 	g_hash_table_destroy(textroom->participants);
 	g_hash_table_destroy(textroom->allowed);
 	if(textroom->history)
@@ -1820,7 +1822,6 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
         gboolean is_owner = !strcasecmp(username_text, textroom->owner_id);
         gboolean is_operator = !strcasecmp(username_text, textroom->video_operator_id);
         json_t *playlist = textroom->playlist;
-        guint64 current_movie = textroom->current_movie;
         if (send_history) {
             if (textroom->history != NULL && textroom->history->head != NULL) {
                 GList *temp = textroom->history->head;
@@ -1892,7 +1893,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
                 json_object_set_new(reply, "operator_id", json_string(textroom->video_operator_id));
             }
             json_object_set(reply, "playlist", playlist);
-            json_object_set_new(reply, "current_movie", json_integer(current_movie));
+            json_object_set_new(reply, "current_movie", json_string(textroom->current_movie));
             json_object_set_new(reply, "participants", list);
         }
         janus_mutex_unlock(&session->mutex);
@@ -3306,7 +3307,7 @@ janus_plugin_result *janus_textroom_handle_incoming_request(janus_plugin_session
         }
         if (current_movie) {
             json_object_set(syncronization_json, "current_movie", current_movie);
-            guint64 cur_movie = json_integer_value(current_movie);
+            gchar *cur_movie = g_strdup(json_string_value(current_movie));
             textroom->current_movie = cur_movie;
         }
 
